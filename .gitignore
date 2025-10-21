@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch models and checkpoints
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# Training logs and outputs
+train_logs/
+outputs_all/
+scores_all/
+wandb/
+lightning_logs/
+
+# Large datasets (keep structure, ignore data)
+MindEyeV2/mindeyev2/*.hdf5
+MindEyeV2/mindeyev2/wds/
+nsddata_stimuli/
+nsddata/
+
+# Hugging Face cache
+.cache/
+huggingface/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.out
+
+# Weights & Biases
+wandb/
+
+# Large model files
+*.bin
+*.safetensors
+*.ckpt
+
+# Data files
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# Generated images (keep structure, ignore content)
+outputs_all/*/cp_4096_v1/*/0.2/*.png
+
+# NSD data (large files)
+nsddata_stimuli/stimuli/nsd/nsd_stimuli.hdf5
+nsddata/experiments/nsd/nsd_expdesign.mat
+nsddata/experiments/nsd/nsd_stim_info_merged.csv
+
+# MindEyeV2 dataset files (large)
+MindEyeV2/mindeyev2/betas_all_subj*.hdf5
+MindEyeV2/mindeyev2/c_all.hdf5
+MindEyeV2/mindeyev2/z_all.hdf5
+MindEyeV2/mindeyev2/g_*_all.hdf5
+
+# Keep directory structure but ignore large files
+!MindEyeV2/mindeyev2/
+!nsddata/
+!nsddata_stimuli/
+!outputs_all/
+!scores_all/
+!train_logs/
