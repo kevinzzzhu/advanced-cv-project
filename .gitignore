@@ -62,6 +62,9 @@ scores_all/
 wandb/
 lightning_logs/
 
+# Large score files (numpy arrays)
+*.npy
+
 # Large datasets (keep structure, ignore data)
 MindEyeV2/mindeyev2/*.hdf5
 MindEyeV2/mindeyev2/wds/
