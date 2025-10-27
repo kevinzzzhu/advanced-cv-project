@@ -96,7 +96,7 @@ subj=args.subj
 wandb_log=args.wandb_log
 multi_subject = args.multi_subject
 
-data_path='MindEyeV2/mindeyev2'
+data_path='../MindEyeV2'
 
 
 batch_size= BATCH_SIZE
@@ -458,7 +458,12 @@ if multisubject_ckpt is not None and not resume_from_ckpt:
 # %%
 # load saved ckpt model weights into current model
 if resume_from_ckpt:
+    print(f"Resuming from checkpoint - epoch before load: {epoch}")
     load_ckpt("last",load_lr=True,load_optimizer=True,load_epoch=True)
+    print(f"Resuming from checkpoint - epoch after load: {epoch}")
+    # Start from the next epoch since we already completed the loaded epoch
+    epoch = epoch + 1
+    print(f"Resuming from checkpoint - starting from epoch: {epoch}")
 # elif wandb_log:
 #     if wandb.run.resumed:
 #         load_ckpt("last",load_lr=True,load_optimizer=True,load_epoch=True)
@@ -822,6 +827,10 @@ for epoch in progress_bar:
     # Save model checkpoint and reconstruct
     if (ckpt_saving) and ((epoch+1) % ckpt_interval == 0):
         save_ckpt(f'last')
+    
+    # Save checkpoint every epoch to prevent data loss on crashes
+    if ckpt_saving:
+        save_ckpt(f'epoch_{epoch}')
 
     # wait for other GPUs to catch up if needed
     accelerator.wait_for_everyone()

@@ -70,7 +70,7 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-data_path='../MindEyeV2/mindeyev2'
+data_path='../MindEyeV2'
 multi_subject=False
 subj=args.subj
 batch_size= BATCH_SIZE

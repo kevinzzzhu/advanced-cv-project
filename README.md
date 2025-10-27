@@ -62,7 +62,7 @@ For full NSD instructions, see the official guide: [How to get the data](https:/
 ### Training
 
 `scripts/train.sh` runs:
-- `src/train_c.py --subj 1 --multi_subject --wandb_log` with `num_epochs=50`
+- `src/train_c.py --subj 1 --multi_subject --wandb_log` with `num_epochs=30`
 - `src/train_g.py --subj 1 --multi_subject --feat g_{2,4,6,8,10,12}` with `num_epochs=30`
 
 Notes:

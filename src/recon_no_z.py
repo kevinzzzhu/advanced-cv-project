@@ -95,7 +95,7 @@ target_fmri_npy = getattr(opt, 'target_fmri_npy', None)
 if guidance_scale==0:
     guidance_strength=0
 
-method='cp_4096_v1_with_z'
+method='cp_4096_v1_no_z'
 niter = 5
 gpu=0
 seed=42
@@ -273,7 +273,7 @@ for imgidx in range(0, 50):  # Restored to original for full processing
         cal_loss = make_gnet_loss(this_target)
     # %%
     c = torch.Tensor(score_cs[imgidx,:].reshape(77,-1)).unsqueeze(0).to(device)
-    z = torch.Tensor(score_zs[imgidx,:].reshape(4,64,64)).unsqueeze(0).to(device)
+    # z = torch.Tensor(score_zs[imgidx,:].reshape(4,64,64)).unsqueeze(0).to(device)  # COMMENTED OUT
     # seed_everything(seed)
     # with torch.no_grad():
     #     with precision_scope("cuda"):
@@ -303,13 +303,13 @@ for imgidx in range(0, 50):  # Restored to original for full processing
     with torch.no_grad():
         with precision_scope("cuda"):
                 for n in range(niter):
-                     uncond_input = tokenizer([""], padding="max_length", max_length=c.shape[1], return_tensors="pt")
-                     uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
-                     # Use z tensor as initial latent
-                     z_enc = scheduler.add_noise(z, torch.randn_like(z), torch.tensor([int(t_enc/ddim_steps*1000)]))
-                     x_samples, x_mid_out = model(
-                                 condition=c,
-                                 latents=z_enc,  # Use z_enc as initial latents
+                    uncond_input = tokenizer([""], padding="max_length", max_length=c.shape[1], return_tensors="pt")
+                    uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+                    # Use z tensor as initial latent
+                    # z_enc = scheduler.add_noise(z, torch.randn_like(z), torch.tensor([int(t_enc/ddim_steps*1000)]))  # COMMENTED OUT
+                    x_samples, x_mid_out = model(
+                                condition=c,
+                                # latents=z_enc,  # Use z_enc as initial latents  # COMMENTED OUT
                                 num_inference_steps=ddim_steps,
                                 t_start=t_enc,
                                 guidance_scale=(scale if not use_gnet else gnet_kappa),
@@ -324,17 +324,18 @@ for imgidx in range(0, 50):  # Restored to original for full processing
                                 num_cfg_steps=int(t_enc*(guidance_strength if not use_gnet else gnet_alpha)),
                                 return_dict=False
                             )
-                     # ===============================
-                     # 循环迭代seed，为了符合cvpr效果
-                     for i in range(40):
-                         torch.randn_like(z)
-                     # ===============================
-                     for i in range(x_samples.shape[0]):
-                         x_sample = 255. * x_samples[i]
-                         x_sampless.append(x_sample)
-                         
-                     # Clear cache after each iteration to prevent memory buildup
-                     torch.cuda.empty_cache()
+                    # ===============================
+                    # Ignore z tensor - using text-guided reconstruction only
+                    # 循环迭代seed，为了符合cvpr效果
+                    # for i in range(40):
+                    #     torch.randn_like(z)  # COMMENTED OUT
+                    # ===============================
+                    for i in range(x_samples.shape[0]):
+                        x_sample = 255. * x_samples[i]
+                        x_sampless.append(x_sample)
+                        
+                    # Clear cache after each iteration to prevent memory buildup
+                    torch.cuda.empty_cache()
                         
     x_sampless = np.concatenate(x_sampless, axis=1)
     Image.fromarray(x_sampless.astype(np.uint8)).save(f'{outpath}/{imgidx:05}.png')
