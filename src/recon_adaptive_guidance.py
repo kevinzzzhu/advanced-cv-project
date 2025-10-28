@@ -44,13 +44,6 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--guidance_strength",     
-    type=float,
-    default=0.2,  
-    help="Base guidance strength (will be adapted)",
-)
-
-parser.add_argument(
     '--base_seed',
     type=int, 
     default=42, 
@@ -58,6 +51,7 @@ parser.add_argument(
 )
 
 # Brain-aware scheduling specific arguments
+
 parser.add_argument(
     "--use_adaptive_scheduling",
     action='store_true',
@@ -166,7 +160,8 @@ class BrainAwareScheduler:
         progress = step / total_steps
         
         if self.schedule_type == "fixed":
-            return args.guidance_strength
+            # Use the mid phase strength as fixed guidance
+            return self.mid_strength
             
         elif self.schedule_type == "linear":
             # Linear decrease from early to late
@@ -558,7 +553,12 @@ def main():
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"../outputs_all/{subject}/brain_scheduling/{args.guidance_scale}/{args.guidance_strength}/{timestamp}"
+    output_dir = (
+        f"../outputs_all/{subject}/brain_scheduling/"
+        f"{args.guidance_scale}/"
+        f"{args.schedule_type}_E{args.early_guidance_strength}_M{args.mid_guidance_strength}_L{args.late_guidance_strength}/"
+        f"{timestamp}"
+    )
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"Output directory: {output_dir}")
@@ -664,7 +664,7 @@ def main():
                             classifier_guidance_scale=args.guidance_scale,
                             guided_condition=CLIP_target,
                             cal_loss=adaptive_guidance_loss,
-                            num_cfg_steps=int(t_enc * args.guidance_strength),
+                            num_cfg_steps=int(t_enc * args.mid_guidance_strength),
                             return_dict=False
                         )
                     
@@ -731,7 +731,6 @@ def main():
         schedule_info = {
             "test_idx": imgidx,
             "schedule_type": args.schedule_type,
-            "guidance_strength": args.guidance_strength,
             "early_strength": args.early_guidance_strength,
             "mid_strength": args.mid_guidance_strength,
             "late_strength": args.late_guidance_strength,
