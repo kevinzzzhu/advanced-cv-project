@@ -126,6 +126,112 @@ args = parser.parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# ============================================================================
+# BRAIN-AWARE ADAPTIVE GUIDANCE IMPLEMENTATION
+# ============================================================================
+
+def compute_phase_guidance(t, T, w_base, guidance_strength_str=0.2):
+    """
+    Compute phase-based guidance weight at timestep t.
+    
+    Phases:
+    - Semantic Formation (τ > 0.7): w = w_base
+    - Structure Refinement (0.3 ≤ τ ≤ 0.7): w = 0.7 * w_base  
+    - Detail Enhancement (τ < 0.3): w = 0.3 * w_base
+    
+    Args:
+        t: current step index (0 to T-1), where 0 is early (high noise) and T-1 is late (low noise)
+        T: total number of timesteps
+        w_base: base guidance scale
+        guidance_strength_str: modulation factor for strength (default 0.2)
+    
+    Returns:
+        phase-specific guidance weight
+    """
+    # tau represents remaining noise level: 1.0 = early/high noise, 0.0 = late/low noise
+    # Early steps (t=0) should have tau close to 1.0 (semantic formation)
+    # Late steps (t=T-1) should have tau close to 0.0 (detail enhancement)
+    tau = (T - t) / T if T > 0 else 0.0  # normalized noise level from 1.0 to 0.0
+    
+    if tau > 0.7:
+        # Semantic Formation: strongest guidance (early steps, high noise)
+        w = w_base
+    elif tau >= 0.3:
+        # Structure Refinement: moderate guidance (middle steps)
+        w = 0.7 * w_base
+    else:
+        # Detail Enhancement: weak guidance (late steps, low noise)
+        w = 0.3 * w_base
+    
+    return w
+
+
+def compute_signal_complexity(guidance_embedding):
+    """
+    Compute fMRI signal complexity from guidance embedding.
+    
+    Complexity = std(guidance_embedding) / baseline
+    This measures signal coherence across dimensions.
+    
+    Args:
+        guidance_embedding: CLIP guidance vector (1, embedding_dim) or (embedding_dim,)
+    
+    Returns:
+        complexity score in [0, 1+]
+    """
+    baseline = 0.1  # empirical baseline complexity
+    
+    # Ensure we have the right shape
+    if guidance_embedding.dim() == 1:
+        guidance_embedding = guidance_embedding.unsqueeze(0)  # (1, embedding_dim)
+    
+    # Compute standard deviation across embedding dimensions
+    complexity = guidance_embedding.std(dim=-1, keepdim=True)  # shape: (1, 1) or (1,)
+    
+    # Normalize by baseline and extract scalar value
+    complexity_score = (complexity / baseline).squeeze().item()
+    
+    return complexity_score
+
+
+def apply_brain_aware_guidance(
+    t, T, w_base, guidance_embedding, 
+    latent, eps_cond, eps_uncond,
+    alpha=0.1
+):
+    """
+    Apply brain-aware adaptive guidance with phase scheduling and signal modulation.
+    
+    w_final = w(τ) * (1 + α * Complexity(s))
+    
+    Args:
+        t: current timestep
+        T: total timesteps
+        w_base: base guidance scale
+        guidance_embedding: CLIP embedding for this sample
+        latent: current latent
+        eps_cond: conditional prediction
+        eps_uncond: unconditional prediction
+        alpha: modulation strength (default 0.1)
+    
+    Returns:
+        guided prediction and final guidance weight
+    """
+    # Step 1: Get phase-based guidance
+    w_phase = compute_phase_guidance(t, T, w_base)
+    
+    # Step 2: Compute brain signal complexity
+    complexity = compute_signal_complexity(guidance_embedding)
+    
+    # Step 3: Modulate by signal complexity
+    w_final = w_phase * (1.0 + alpha * complexity)
+    
+    # Step 4: Apply guided denoising
+    eps_pred = eps_uncond + w_final * (eps_cond - eps_uncond)
+    
+    return eps_pred, w_final
+
+
 class BrainAwareScheduler:
     """
     Brain-aware guidance scheduler that adapts guidance strength based on diffusion step
@@ -408,6 +514,206 @@ def evaluate_reconstruction_quality(reconstruction, gt_image, ssim_evaluator):
     ssim_score = ssim_evaluator.compute(reconstruction, gt_image)
     return ssim_score
 
+def brain_aware_denoising_loop(
+    unet, scheduler_sd, vae, text_encoder, tokenizer,
+    latents, condition_embeddings, guidance_embedding,
+    num_inference_steps=50, t_start=None, guidance_scale_base=300000,
+    alpha=0.1, device='cuda', measure_similarity_only=False
+):
+    """
+    Custom denoising loop with brain-aware adaptive guidance.
+    
+    This function replaces the standard model() call and applies
+    brain-aware guidance at each timestep.
+    
+    Args:
+        unet: UNet model
+        scheduler_sd: DDIM scheduler
+        vae: VAE model
+        text_encoder: CLIP text encoder
+        tokenizer: CLIP tokenizer
+        latents: Initial latent tensor
+        condition_embeddings: Conditional text embeddings
+        guidance_embedding: CLIP guidance embedding (for complexity computation)
+        num_inference_steps: Number of denoising steps
+        t_start: Starting timestep (if None, uses full steps)
+        guidance_scale_base: Base guidance scale (w_base)
+        alpha: Modulation strength for complexity (default 0.1)
+        device: Device to run on
+        measure_similarity_only: If True, only measure similarity without applying guidance (for analysis)
+    
+    Returns:
+        Decoded image samples (or None if measure_similarity_only=True)
+    """
+    from tqdm import tqdm
+    
+    # Prepare unconditional embeddings
+    uncond_input = tokenizer([""], padding="max_length", max_length=condition_embeddings.shape[1], return_tensors="pt")
+    uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+    
+    # Ensure condition_embeddings match the dtype of uncond_embeddings (for UNet compatibility)
+    if condition_embeddings.dtype != uncond_embeddings.dtype:
+        condition_embeddings = condition_embeddings.to(uncond_embeddings.dtype)
+        print(f"WARNING: Converted condition_embeddings from {condition_embeddings.dtype} to {uncond_embeddings.dtype}")
+    
+    # Debug: Print embedding info at start
+    print(f"\n=== Denoising Loop Start ===")
+    print(f"Condition embeddings: shape={condition_embeddings.shape}, dtype={condition_embeddings.dtype}, norm={torch.norm(condition_embeddings).item():.6f}")
+    print(f"Uncond embeddings: shape={uncond_embeddings.shape}, dtype={uncond_embeddings.dtype}, norm={torch.norm(uncond_embeddings).item():.6f}")
+    print(f"Embedding difference norm: {torch.norm(condition_embeddings - uncond_embeddings).item():.10f}")
+    print(f"Max absolute difference: {torch.max(torch.abs(condition_embeddings - uncond_embeddings)).item():.10f}")
+    print("=" * 50 + "\n")
+    
+    # Set up scheduler
+    scheduler_sd.set_timesteps(num_inference_steps, device=device)
+    timesteps = scheduler_sd.timesteps
+    
+    # If t_start is specified, only use timesteps from t_start onwards
+    if t_start is not None:
+        start_idx = len(timesteps) - t_start - 1
+        timesteps = timesteps[start_idx:]
+        # Add noise if starting from middle
+        latents = scheduler_sd.add_noise(latents, torch.randn_like(latents), timesteps[0:1])
+    
+    T = len(timesteps)
+    
+    # Prepare latent input
+    latent_t = latents
+    
+    # Store guidance weights for logging (optional)
+    guidance_weights = []
+    
+    # Store cosine similarities for analysis (optional)
+    cosine_similarities = []
+    tau_values = []
+    
+    # Denoising loop with brain-aware adaptive guidance
+    for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
+        # Scale model input
+        latent_model_input = scheduler_sd.scale_model_input(latent_t, t)
+        
+        # Get conditional prediction
+        with torch.no_grad():
+            # Debug embeddings before UNet call
+            if i == 0:
+                print(f"\n=== Step {i} Debug ===")
+                print(f"Condition embeddings shape: {condition_embeddings.shape}, dtype: {condition_embeddings.dtype}")
+                print(f"Uncond embeddings shape: {uncond_embeddings.shape}, dtype: {uncond_embeddings.dtype}")
+                print(f"Embedding diff norm: {torch.norm(condition_embeddings - uncond_embeddings).item():.10f}")
+                print(f"Embedding max diff: {torch.max(torch.abs(condition_embeddings - uncond_embeddings)).item():.10f}")
+                print(f"Embedding are close? {torch.allclose(condition_embeddings, uncond_embeddings, atol=1e-3)}")
+                print(f"Latent input shape: {latent_model_input.shape}, timestep: {t.item()}")
+            
+            eps_cond = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=condition_embeddings
+            ).sample
+            
+            # Get unconditional prediction
+            eps_uncond = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=uncond_embeddings
+            ).sample
+        
+        # Compute cosine similarity between predictions
+        # Flatten predictions for cosine similarity computation
+        eps_cond_flat = eps_cond.flatten(start_dim=1)
+        eps_uncond_flat = eps_uncond.flatten(start_dim=1)
+        
+        # Check if predictions are identical (for debugging)
+        if i == 0:  # Only print on first step to avoid spam
+            diff_norm = torch.norm(eps_cond_flat - eps_uncond_flat).item()
+            max_diff = torch.abs(eps_cond_flat - eps_uncond_flat).max().item()
+            mean_diff = torch.abs(eps_cond_flat - eps_uncond_flat).mean().item()
+            print(f"UNet output diff_norm={diff_norm:.10f}, max_diff={max_diff:.10f}, mean_diff={mean_diff:.10f}")
+            print(f"eps_cond sample (first 10): {eps_cond_flat[0, :10].detach().cpu().numpy()}")
+            print(f"eps_uncond sample (first 10): {eps_uncond_flat[0, :10].detach().cpu().numpy()}")
+            print(f"eps_cond norm: {torch.norm(eps_cond_flat).item():.6f}, eps_uncond norm: {torch.norm(eps_uncond_flat).item():.6f}")
+            print("=" * 50 + "\n")
+        
+        # Normalize for cosine similarity
+        eps_cond_norm = eps_cond_flat / (eps_cond_flat.norm(dim=1, keepdim=True) + 1e-8)
+        eps_uncond_norm = eps_uncond_flat / (eps_uncond_flat.norm(dim=1, keepdim=True) + 1e-8)
+        
+        # Compute cosine similarity using PyTorch's built-in function for accuracy
+        # This is more numerically stable than manual computation
+        similarity = torch.nn.functional.cosine_similarity(
+            eps_cond_flat, eps_uncond_flat, dim=1
+        ).mean().item()
+        
+        # Debug first step
+        if i == 0:
+            print(f"eps_cond_norm sample: {eps_cond_norm[0, :5].detach().cpu().numpy()}")
+            print(f"eps_uncond_norm sample: {eps_uncond_norm[0, :5].detach().cpu().numpy()}")
+            print(f"Raw similarity (before clamp): {similarity:.15f}")
+        
+        # Clamp similarity to valid range for numerical stability
+        # Note: Cosine similarity can theoretically exceed 1.0 slightly due to floating point precision
+        # but we keep it in valid range [0, 1] for interpretation
+        similarity_clamped = max(-1.0, min(1.0, similarity))
+        
+        # Store the raw (unclamped) similarity for analysis
+        cosine_similarities.append(similarity_clamped)
+        
+        # Debug: warn if we're hitting the ceiling
+        if i == 0:
+            if similarity > 0.9999:
+                print(f"WARNING: Similarity very close to 1.0 ({similarity:.8f}), predictions are nearly identical")
+        
+        # Compute normalized progress (tau: 1.0 = early/high noise, 0.0 = late/low noise)
+        tau = (T - i) / T if T > 0 else 0.0
+        tau_values.append(tau)
+        
+        # Apply brain-aware adaptive guidance (skip if only measuring similarity)
+        if measure_similarity_only:
+            # For similarity measurement, use standard CFG without phase modulation
+            # This shows natural divergence without guidance interference
+            eps_pred = eps_uncond + guidance_scale_base * (eps_cond - eps_uncond)
+            w_used = guidance_scale_base
+        else:
+            # NOTE: Similarity is computed BEFORE applying guidance (above), so guidance doesn't affect similarity values
+            # Use step index (i) for phase computation: i=0 is early (high noise), i=T-1 is late (low noise)
+            # Phase guidance uses tau = (T-i)/T: tau=1.0 (early/semantic) to tau=0.0 (late/detail)
+            eps_pred, w_used = apply_brain_aware_guidance(
+                t=i,  # Current step index (0 to T-1), where 0 is early/high noise, T-1 is late/low noise
+                T=T,  # Total steps
+                w_base=guidance_scale_base,
+                guidance_embedding=guidance_embedding,
+                latent=latent_t,
+                eps_cond=eps_cond,
+                eps_uncond=eps_uncond,
+                alpha=alpha
+            )
+        
+        guidance_weights.append(w_used)
+        
+        # Denoise step
+        extra_step_kwargs = {}
+        if "eta" in set(scheduler_sd.step.__code__.co_varnames):
+            extra_step_kwargs["eta"] = 0.0
+        
+        latent_t = scheduler_sd.step(eps_pred, t, latent_t, **extra_step_kwargs).prev_sample
+    
+    # If only measuring similarity, return early without decoding
+    if measure_similarity_only:
+        return None, cosine_similarities, tau_values, guidance_weights
+    
+    # Decode latents to images
+    latent_t = 1 / vae.config.scaling_factor * latent_t
+    with torch.no_grad():
+        images = vae.decode(latent_t).sample
+    
+    # Normalize images to [0, 1]
+    images = (images / 2 + 0.5).clamp(0, 1)
+    
+    # Convert to numpy
+    images = images.cpu().permute(0, 2, 3, 1).numpy()
+    
+    # Return images along with similarity data if available
+    return images, cosine_similarities, tau_values, guidance_weights
+
 def visualize_schedule_dynamics(scheduler, output_dir, ddim_steps=50):
     """Visualize the guidance schedule dynamics"""
     progresses = np.linspace(0, 1, 50)
@@ -433,6 +739,128 @@ def visualize_schedule_dynamics(scheduler, output_dir, ddim_steps=50):
     plt.savefig(schedule_plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved schedule visualization to {schedule_plot_path}")
+
+def plot_phase_similarity(tau_values, cosine_similarities, output_dir, imgidx=None):
+    """
+    Plot cosine similarity between conditional and unconditional predictions across diffusion phases.
+    
+    Args:
+        tau_values: List of normalized progress values (1.0 = early, 0.0 = late)
+        cosine_similarities: List of cosine similarity values
+        output_dir: Directory to save the figure
+        imgidx: Optional image index for filename
+    """
+    if len(tau_values) == 0 or len(cosine_similarities) == 0:
+        print("Warning: No similarity data to plot")
+        return
+    
+    plt.figure(figsize=(8, 6))
+    
+    # Plot similarity vs tau (reverse order so tau goes from 1.0 to 0.0 left to right)
+    tau_plot = np.array(tau_values)
+    sim_plot = np.array(cosine_similarities)
+    
+    # Sort by tau (descending) for proper plotting
+    sort_idx = np.argsort(tau_plot)[::-1]
+    tau_sorted = tau_plot[sort_idx]
+    sim_sorted = sim_plot[sort_idx]
+    
+    # Plot actual similarity values (not deviation)
+    # The expected behavior: early phases show divergence (0.7-0.8), late phases show convergence (0.95+)
+    plt.plot(tau_sorted, sim_sorted, 'b-', linewidth=2.5, label='Cosine Similarity')
+    plt.ylabel('Cosine Similarity', fontsize=12)
+    plt.title('Cosine Similarity Between Conditional and Unconditional Predictions', fontsize=13)
+    y_plot_data = sim_sorted
+    
+    # Add phase boundaries
+    plt.axvline(x=0.7, color='r', linestyle='--', alpha=0.7, linewidth=1.5, label='Semantic/Structure Boundary')
+    plt.axvline(x=0.3, color='g', linestyle='--', alpha=0.7, linewidth=1.5, label='Structure/Detail Boundary')
+    
+    # Add phase annotations
+    plt.axvspan(0.7, 1.0, alpha=0.1, color='red', label='Semantic Formation ($\\tau > 0.7$)')
+    plt.axvspan(0.3, 0.7, alpha=0.1, color='orange', label='Structure Refinement ($0.3 \\leq \\tau \\leq 0.7$)')
+    plt.axvspan(0.0, 0.3, alpha=0.1, color='green', label='Detail Enhancement ($\\tau < 0.3$)')
+    
+    plt.xlabel('Normalized Diffusion Progress ($\\tau$)', fontsize=12)
+    plt.legend(loc='lower left', fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.xlim([0, 1.0])
+    # Auto-scale y-axis to show actual variation, with small padding
+    sim_min = np.min(y_plot_data)
+    sim_max = np.max(y_plot_data)
+    sim_range = sim_max - sim_min
+    # Print detailed statistics (using original sim_sorted values, not adjusted)
+    print(f"\n=== Similarity Statistics ===")
+    print(f"Min similarity: {np.min(sim_sorted):.6f}")
+    print(f"Max similarity: {np.max(sim_sorted):.6f}")
+    print(f"Range: {np.max(sim_sorted) - np.min(sim_sorted):.6f}")
+    print(f"Mean: {np.mean(sim_sorted):.6f}")
+    print(f"Std: {np.std(sim_sorted):.6f}")
+    
+    # Calculate phase-specific means
+    early_mask = tau_sorted > 0.7
+    mid_mask = (tau_sorted >= 0.3) & (tau_sorted <= 0.7)
+    late_mask = tau_sorted < 0.3
+    
+    if np.any(early_mask):
+        print(f"Early phase (τ>0.7): mean={np.mean(sim_sorted[early_mask]):.6f}, n={np.sum(early_mask)}")
+    if np.any(mid_mask):
+        print(f"Mid phase (0.3≤τ≤0.7): mean={np.mean(sim_sorted[mid_mask]):.6f}, n={np.sum(mid_mask)}")
+    if np.any(late_mask):
+        print(f"Late phase (τ<0.3): mean={np.mean(sim_sorted[late_mask]):.6f}, n={np.sum(late_mask)}")
+    print("=" * 40 + "\n")
+    
+    # Set appropriate y-axis range based on expected similarity values
+    # Expected: early phases 0.7-0.8, mid phases 0.8-0.9, late phases 0.95+
+    if sim_min < 0.9:  # If we see natural divergence (not all near 1.0)
+        # Use full range with padding
+        padding = sim_range * 0.1 if sim_range > 0.01 else 0.05
+        plt.ylim([max(0.6, sim_min - padding), min(1.0, sim_max + padding)])
+        print(f"Similarity range (natural divergence): [{sim_min:.6f}, {sim_max:.6f}], range={sim_range:.6f}")
+    elif sim_range < 0.01:  # Very small range, all values near 1.0
+        sim_mean = np.mean(y_plot_data)
+        y_range = max(0.05, sim_range * 10)  # Show wider range to capture variation
+        plt.ylim([sim_mean - y_range/2, sim_mean + y_range/2])
+        print(f"WARNING: Similarity range is very small ({sim_range:.6f}), all values near 1.0")
+        print(f"  This suggests predictions are nearly identical - may need lower guidance scale")
+        print(f"  Using y-axis: [{sim_mean - y_range/2:.6f}, {sim_mean + y_range/2:.6f}]")
+    else:
+        padding = sim_range * 0.1  # 10% padding
+        plt.ylim([max(0.6, sim_min - padding), min(1.0, sim_max + padding)])
+        print(f"Similarity range: [{sim_min:.6f}, {sim_max:.6f}], range={sim_range:.6f}")
+    
+    # Add text annotations for typical values
+    if len(sim_sorted) > 0:
+        early_sim = np.mean(sim_sorted[tau_sorted > 0.7]) if np.any(tau_sorted > 0.7) else None
+        mid_sim = np.mean(sim_sorted[(tau_sorted >= 0.3) & (tau_sorted <= 0.7)]) if np.any((tau_sorted >= 0.3) & (tau_sorted <= 0.7)) else None
+        late_sim = np.mean(sim_sorted[tau_sorted < 0.3]) if np.any(tau_sorted < 0.3) else None
+        
+        # Calculate y-position offset based on y-axis range (use y_plot_data for positioning)
+        y_range = plt.ylim()[1] - plt.ylim()[0]
+        y_offset = -y_range * 0.05  # 5% of y-range below the point
+        
+        # Plot annotations with actual similarity values (placed below the line)
+        if early_sim is not None:
+            plt.text(0.85, early_sim + y_offset, f'{early_sim:.3f}', fontsize=9, ha='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        if mid_sim is not None:
+            plt.text(0.5, mid_sim + y_offset, f'{mid_sim:.3f}', fontsize=9, ha='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        if late_sim is not None:
+            plt.text(0.15, late_sim + y_offset, f'{late_sim:.3f}', fontsize=9, ha='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    # Save figure
+    if imgidx is not None:
+        fig_path = os.path.join(output_dir, f"phase_similarity_{imgidx:05d}.png")
+    else:
+        fig_path = os.path.join(output_dir, "phase_similarity.png")
+    
+    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved phase similarity plot to {fig_path}")
 
 def main():
     """Main reconstruction function with brain-aware guidance scheduling"""
@@ -625,14 +1053,25 @@ def main():
             
             with torch.no_grad():
                 with precision_scope("cuda"):
-                    uncond_input = tokenizer([""], padding="max_length", max_length=c.shape[1], return_tensors="pt")
-                    uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
-                    
                     # Use z tensor as initial latent
-                    z_enc = scheduler_sd.add_noise(z, torch.randn_like(z), torch.tensor([int(t_enc/ddim_steps*1000)]))
+                    # For DDIM, we need to set timesteps first
+                    scheduler_sd.set_timesteps(ddim_steps, device=device)
+                    timesteps = scheduler_sd.timesteps
+                    
+                    # Add noise based on t_enc (strength)
+                    if t_enc < len(timesteps):
+                        start_timestep = timesteps[t_enc]
+                        z_enc = scheduler_sd.add_noise(z, torch.randn_like(z), start_timestep.unsqueeze(0))
+                    else:
+                        z_enc = z
                     
                     if args.disable_guidance:
-                        # Test without guidance
+                        # Test without guidance - use standard CFG
+                        # Get unconditional embeddings
+                        uncond_input = tokenizer([""], padding="max_length", max_length=c.shape[1], return_tensors="pt")
+                        uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
+                        
+                        # Use standard model call without CLIP guidance
                         x_samples, x_mid_out = model(
                             condition=c,
                             latents=z_enc,
@@ -649,24 +1088,41 @@ def main():
                             num_cfg_steps=0,
                             return_dict=False
                         )
+                        
+                        # For disabled guidance, set empty similarity data
+                        cosine_sims = []
+                        tau_vals = []
+                        guid_weights = []
                     else:
-                        # Use adaptive guidance
-                        x_samples, x_mid_out = model(
-                            condition=c,
+                        # Use brain-aware adaptive guidance
+                        # Extract guidance embedding from condition (use first embedding)
+                        guidance_embedding = c[0:1]  # Shape: (1, 77, embedding_dim)
+                        
+                        # Flatten or use mean for complexity computation
+                        # We'll use the mean across sequence length for a single embedding vector
+                        guidance_embedding_mean = guidance_embedding.mean(dim=1)  # (1, embedding_dim)
+                        
+                        # Use brain-aware denoising loop
+                        x_samples, cosine_sims, tau_vals, guid_weights = brain_aware_denoising_loop(
+                            unet=unet,
+                            scheduler_sd=scheduler_sd,
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
                             latents=z_enc,
+                            condition_embeddings=c,
+                            guidance_embedding=guidance_embedding_mean,
                             num_inference_steps=ddim_steps,
-                            t_start=t_enc,
-                            guidance_scale=scale,
-                            eta=0.,
-                            uncond_embeddings=uncond_embeddings,
-                            num_images_per_prompt=1,
-                            output_type='np',
-                            classifier_guidance_scale=args.guidance_scale,
-                            guided_condition=CLIP_target,
-                            cal_loss=adaptive_guidance_loss,
-                            num_cfg_steps=int(t_enc * args.mid_guidance_strength),
-                            return_dict=False
+                            t_start=t_enc if t_enc < ddim_steps else None,
+                            guidance_scale_base=args.guidance_scale,
+                            alpha=0.1,
+                            device=device
                         )
+                        
+                        # Store similarity data for plotting (use first reconstruction)
+                        if n == 0 and imgidx == test_indices[0]:
+                            # Plot and save cosine similarity figure
+                            plot_phase_similarity(tau_vals, cosine_sims, output_dir, imgidx=imgidx)
                     
                     # Follow original pattern for CVPR effects
                     for i in range(40):
@@ -674,10 +1130,10 @@ def main():
                     
                     # Process images 
                     for i in range(x_samples.shape[0]):
-                        x_sample = 255. * x_samples[i]  # Scale to [0, 255]
+                        x_sample = x_samples[i]  # Already in [0, 1] range from brain_aware_denoising_loop
                         # Convert to tensor format for evaluation
                         if len(x_sample.shape) == 3:  # HWC format
-                            x_sample_tensor = torch.from_numpy(x_sample).permute(2, 0, 1).float() / 255.0
+                            x_sample_tensor = torch.from_numpy(x_sample).permute(2, 0, 1).float()
                             x_sample_tensor = (x_sample_tensor * 2) - 1  # [0, 1] -> [-1, 1]
                         else:
                             x_sample_tensor = torch.from_numpy(x_sample).float()
